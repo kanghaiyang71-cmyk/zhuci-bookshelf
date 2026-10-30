@@ -22,8 +22,10 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -32,16 +34,37 @@ jobs:
 
       - name: Extract project
         run: |
-          unzip -q "逐词书架_Android工程首版.zip" -d extracted
+          python3 - <<'PY'
+          import os, zipfile
+          from pathlib import PurePosixPath
+
+          with zipfile.ZipFile("逐词书架_Android工程首版.zip") as z:
+              for item in z.infolist():
+                  name = item.filename.encode("cp437").decode("utf-8")
+                  parts = PurePosixPath(name).parts
+                  if len(parts) < 2:
+                      continue
+                  rel = PurePosixPath(*parts[1:])
+                  target = os.path.join("extracted", str(rel))
+                  if item.is_dir():
+                      os.makedirs(target, exist_ok=True)
+                  else:
+                      os.makedirs(os.path.dirname(target), exist_ok=True)
+                      with z.open(item) as src, open(target, "wb") as dst:
+                          dst.write(src.read())
+
+          PY
+          test -f extracted/app/build.gradle
+          test -f extracted/settings.gradle
 
       - name: Build APK
         run: |
-          cd extracted/逐词书架-Android
+          cd extracted
           gradle --no-daemon :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: zhuci-bookshelf-debug-apk
-          path: extracted/逐词书架-Android/app/build/outputs/apk/debug/app-debug.apk
+          path: extracted/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

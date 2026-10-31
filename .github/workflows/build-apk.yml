@@ -57,13 +57,10 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-          # 接受 Android SDK 许可证
-          # 关闭 pipefail，避免 yes 提前退出导致整个管道失败
           set +o pipefail
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
           set -o pipefail
 
-          # 安装 Android 35 和对应构建工具
           "$SDKMANAGER" \
             --sdk_root="$SDK_ROOT" \
             "platforms;android-35" \
@@ -110,7 +107,6 @@ jobs:
 
                   parts = PurePosixPath(name).parts
 
-                  # 去掉 ZIP 最外层项目目录
                   if len(parts) < 2:
                       continue
 
@@ -160,7 +156,56 @@ jobs:
           print("All required Android project files were found.")
           PY
 
-      # 6. 检查 Android 工程配置
+      # 6. 统一 Java 和 Kotlin 编译目标为 17
+      - name: Align Java and Kotlin JVM targets
+        working-directory: extracted
+        shell: bash
+        run: |
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("app/build.gradle")
+
+          if not path.is_file():
+              raise SystemExit("ERROR: app/build.gradle not found")
+
+          text = path.read_text(encoding="utf-8")
+
+          if "android {" not in text:
+              raise SystemExit("ERROR: android block not found")
+
+          if "compileOptions" in text or "kotlinOptions" in text:
+              raise SystemExit(
+                  "ERROR: Existing JVM configuration detected. "
+                  "Please inspect app/build.gradle before modifying it."
+              )
+
+          configuration = """android {
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          """
+
+          text = text.replace("android {", configuration, 1)
+          path.write_text(text, encoding="utf-8")
+
+          print("Java sourceCompatibility: 17")
+          print("Java targetCompatibility: 17")
+          print("Kotlin jvmTarget: 17")
+          PY
+
+          echo "Verifying JVM target configuration..."
+          grep -A 8 '^android {' app/build.gradle
+
+      # 7. 检查工程配置
       - name: Verify project configuration
         shell: bash
         run: |
@@ -168,18 +213,19 @@ jobs:
 
           cd extracted
 
-          echo "Checking Gradle configuration..."
-
           grep -q "com.android.application" build.gradle
           grep -q "8.7.3" build.gradle
           grep -q "2.0.21" build.gradle
 
           grep -q "compileSdk 35" app/build.gradle
           grep -q "minSdk 23" app/build.gradle
+          grep -q "sourceCompatibility JavaVersion.VERSION_17" app/build.gradle
+          grep -q "targetCompatibility JavaVersion.VERSION_17" app/build.gradle
+          grep -q "jvmTarget = '17'" app/build.gradle
 
           echo "Project configuration checks passed."
 
-      # 7. 编译 APK
+      # 8. 编译 APK
       - name: Build APK
         shell: bash
         run: |
@@ -199,7 +245,7 @@ jobs:
           echo "APK build successful."
           ls -lh "$APK"
 
-      # 8. 上传 APK
+      # 9. 上传 APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

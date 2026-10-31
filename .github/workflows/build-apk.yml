@@ -2,7 +2,8 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -10,25 +11,31 @@ permissions:
 
 jobs:
   build:
+    name: Build Zhuci Bookshelf
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      # 1. 下载仓库
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. 配置 Java 17
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. 安装 Android SDK
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -e
+
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
           if [ ! -d "$SDK_ROOT" ]; then
-            echo "Android SDK directory not found: $SDK_ROOT"
+            echo "ERROR: Android SDK directory not found: $SDK_ROOT"
             exit 1
           fi
 
@@ -39,83 +46,164 @@ jobs:
           fi
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager not found under $SDK_ROOT"
+            echo "ERROR: sdkmanager not found"
             find "$SDK_ROOT" -maxdepth 5 -type f | head -100
             exit 1
           fi
 
           echo "Using SDK manager: $SDKMANAGER"
+
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
+          # 接受 Android SDK 许可证
+          # 关闭 pipefail，避免 yes 提前退出导致整个管道失败
+          set +o pipefail
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-35" "build-tools;35.0.0"
+          set -o pipefail
 
+          # 安装 Android 35 和对应构建工具
+          "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "Android SDK installation completed."
+
+      # 4. 配置 Gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Extract project
+      # 5. 解压 Android 工程
+      - name: Extract Android project
         shell: bash
         run: |
           set -e
+
           python3 - <<'PY'
           import os
           import zipfile
           from pathlib import PurePosixPath
 
           archive = "逐词书架_Android工程首版.zip"
-          os.makedirs("extracted", exist_ok=True)
+          output = "extracted"
+
+          if not os.path.isfile(archive):
+              raise SystemExit("ERROR: Project ZIP not found: " + archive)
+
+          os.makedirs(output, exist_ok=True)
 
           with zipfile.ZipFile(archive) as z:
+              bad_file = z.testzip()
+
+              if bad_file:
+                  raise SystemExit("ERROR: Corrupted ZIP entry: " + bad_file)
+
               for item in z.infolist():
-                  name = item.filename.encode("cp437").decode("utf-8")
+                  try:
+                      name = item.filename.encode("cp437").decode("utf-8")
+                  except UnicodeEncodeError:
+                      name = item.filename
+
                   parts = PurePosixPath(name).parts
 
+                  # 去掉 ZIP 最外层项目目录
                   if len(parts) < 2:
                       continue
 
                   rel = PurePosixPath(*parts[1:])
-                  target = os.path.join("extracted", str(rel))
+
+                  if rel.is_absolute() or ".." in rel.parts:
+                      raise SystemExit("ERROR: Unsafe ZIP path: " + name)
+
+                  target = os.path.join(output, *rel.parts)
 
                   if item.is_dir():
                       os.makedirs(target, exist_ok=True)
                   else:
                       os.makedirs(os.path.dirname(target), exist_ok=True)
-                      with z.open(item) as src, open(target, "wb") as dst:
-                          dst.write(src.read())
 
-          required = (
-              "extracted/settings.gradle",
-              "extracted/build.gradle",
-              "extracted/gradle.properties",
-              "extracted/app/build.gradle",
-              "extracted/app/src/main/AndroidManifest.xml",
-              "extracted/app/src/main/assets/reader.html",
-          )
+                      with z.open(item) as src:
+                          with open(target, "wb") as dst:
+                              while True:
+                                  data = src.read(1024 * 1024)
+                                  if not data:
+                                      break
+                                  dst.write(data)
 
-          missing = [path for path in required if not os.path.isfile(path)]
+          required_files = [
+              "settings.gradle",
+              "build.gradle",
+              "gradle.properties",
+              "app/build.gradle",
+              "app/src/main/AndroidManifest.xml",
+              "app/src/main/assets/reader.html",
+          ]
+
+          missing = []
+
+          for file in required_files:
+              path = os.path.join(output, file)
+              if not os.path.isfile(path):
+                  missing.append(path)
 
           if missing:
-              raise SystemExit("Missing required files: " + ", ".join(missing))
+              raise SystemExit(
+                  "ERROR: Missing project files:\n" + "\n".join(missing)
+              )
 
-          print("Project extraction and structure checks passed.")
+          print("ZIP integrity check passed.")
+          print("Project extraction completed.")
+          print("All required Android project files were found.")
           PY
 
+      # 6. 检查 Android 工程配置
+      - name: Verify project configuration
+        shell: bash
+        run: |
+          set -e
+
+          cd extracted
+
+          echo "Checking Gradle configuration..."
+
+          grep -q "com.android.application" build.gradle
+          grep -q "8.7.3" build.gradle
+          grep -q "2.0.21" build.gradle
+
+          grep -q "compileSdk 35" app/build.gradle
+          grep -q "minSdk 23" app/build.gradle
+
+          echo "Project configuration checks passed."
+
+      # 7. 编译 APK
       - name: Build APK
         shell: bash
         run: |
           set -e
-          cd extracted
-          gradle --no-daemon --stacktrace :app:assembleDebug
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
 
+          cd extracted
+
+          gradle --no-daemon --stacktrace :app:assembleDebug
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK build successful."
+          ls -lh "$APK"
+
+      # 8. 上传 APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: zhuci-bookshelf-debug-apk
           path: extracted/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
